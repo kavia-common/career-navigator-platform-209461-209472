@@ -212,7 +212,13 @@ openapi_tags = [
 
 app = FastAPI(
     title="Career Navigator Backend",
-    description="Backend API for the Career Navigator Platform MVP. Provides role data, gap analysis, roadmap generation, progress tracking, and LLM recommendations.",
+    description=(
+        "Backend API for the Career Navigator Platform MVP. "
+        "Provides role data, gap analysis, roadmap generation, progress tracking, and LLM recommendations.\n\n"
+        "Notes:\n"
+        "- This service does not expose WebSockets; all endpoints are REST.\n"
+        "- Set DATABASE_URL, LLM_SERVICE_URL, and CORS_ORIGINS via environment variables (see .env.example)."
+    ),
     version="0.1.0",
     openapi_tags=openapi_tags,
 )
@@ -280,6 +286,7 @@ def seed_minimal(db: Session) -> None:
 @app.get("/", tags=["Health"], summary="Health Check")
 def health_check():
     """Health check endpoint.
+
     Returns:
         dict: Simple health message for monitoring.
     """
@@ -442,8 +449,15 @@ def post_roadmap(payload: RoadmapRequest, db: Session = Depends(get_db)):
 
 
 # PUBLIC_INTERFACE
+class ProgressUpdateResponse(BaseModel):
+    message: str = Field(..., description="Status message")
+    user_email: str = Field(..., description="Email address of the user whose progress was updated")
+    skill_name: str = Field(..., description="Skill name for which the progress was updated")
+    progress: float = Field(..., ge=0.0, le=1.0, description="Progress value after update (0..1)")
+
 @app.post(
     "/progress/update",
+    response_model=ProgressUpdateResponse,
     tags=["Progress"],
     summary="Update user skill progress",
     description="Update or create the user's progress for a given skill.",
