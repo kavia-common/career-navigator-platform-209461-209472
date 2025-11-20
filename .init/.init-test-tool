@@ -1,0 +1,4 @@
+{
+    "command": "pytest",
+    "working_directory": "/home/kavia/workspace/code-generation/career-navigator-platform-209461-209472/backend_fastapi"
+}
