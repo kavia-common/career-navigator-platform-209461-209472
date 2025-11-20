@@ -39,6 +39,7 @@ from sqlalchemy import (
     Table,
     Text,
     create_engine,
+    text,
 )
 from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
 
@@ -288,9 +289,27 @@ def health_check():
     """Health check endpoint.
 
     Returns:
-        dict: Simple health message for monitoring.
+        dict: Health information including message, version, and a basic DB connectivity ping.
     """
-    return {"message": "Healthy"}
+    # Basic DB connectivity ping
+    db_ok = True
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except Exception:
+        db_ok = False
+
+    return {"message": "Healthy", "version": "0.1.0", "database_ok": db_ok}
+
+# PUBLIC_INTERFACE
+@app.get("/health", tags=["Health"], summary="Health Check (alias)")
+def health_check_alias():
+    """Alias for root health check to support infrastructure health probes.
+
+    Returns:
+        dict: Same payload as root health endpoint.
+    """
+    return health_check()
 
 
 # PUBLIC_INTERFACE
