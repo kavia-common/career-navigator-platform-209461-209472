@@ -1,21 +1,53 @@
+# -*- coding: utf-8 -*-
+"""
+FastAPI backend providing role catalog, gap analysis, roadmap graph generation,
+user progress tracking, and a proxy to an LLM recommendation service.
+
+This file defines:
+- SQLAlchemy models (Role, Skill, User, UserSkillProgress, role_skills association)
+- Pydantic schemas to match the provided OpenAPI spec
+- Routes:
+  GET /roles
+  GET /roles/{role_id}
+  POST /gap-analysis
+  POST /roadmap
+  POST /progress/update
+  POST /recommend
+
+Environment variables:
+- DATABASE_URL (SQLite URL, default sqlite:///./career_nav.db)
+- LLM_SERVICE_URL (URL to the /recommend endpoint of the LLM microservice)
+- CORS_ORIGINS (comma-separated list or '*')
+
+Uvicorn entry:
+  uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+"""
 import os
 from typing import List, Optional, Dict, Any
 
+import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, Column, Integer, String, Text, ForeignKey, Float, Table
-from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
-import httpx
+from sqlalchemy import (
+    Column,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Table,
+    Text,
+    create_engine,
+)
+from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
 
-# Load environment variables from .env
+# Load environment variables
 load_dotenv()
 
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
-
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./career_nav.db")
 LLM_SERVICE_URL = os.getenv("LLM_SERVICE_URL", "http://localhost:8001/recommend")
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
@@ -23,17 +55,16 @@ CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
 # -----------------------------------------------------------------------------
 # Database Setup (SQLAlchemy)
 # -----------------------------------------------------------------------------
-
-# SQLite needs check_same_thread=False for standard synchronous engine
-connect_args = {}
+connect_args: Dict[str, Any] = {}
 if DATABASE_URL.startswith("sqlite"):
+    # For SQLite in single-threaded typical FastAPI dev mode
     connect_args = {"check_same_thread": False}
 
 engine = create_engine(DATABASE_URL, echo=False, connect_args=connect_args)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
-# Association table for many-to-many Role-Skill
+# Association table for Role<->Skill with an optional required_level
 role_skills_table = Table(
     "role_skills",
     Base.metadata,
@@ -42,8 +73,10 @@ role_skills_table = Table(
     Column("required_level", Float, nullable=True),
 )
 
+
 class Role(Base):
-    """Role model representing job roles."""
+    """SQLAlchemy model for job roles."""
+
     __tablename__ = "roles"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -54,7 +87,8 @@ class Role(Base):
 
 
 class Skill(Base):
-    """Skill model representing skills aligned to frameworks (e.g., SFIA)."""
+    """SQLAlchemy model for skills."""
+
     __tablename__ = "skills"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -66,7 +100,8 @@ class Skill(Base):
 
 
 class User(Base):
-    """Minimal user table to track progress updates. Expand as needed."""
+    """SQLAlchemy model for users (minimal for MVP)."""
+
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -75,21 +110,22 @@ class User(Base):
 
 
 class UserSkillProgress(Base):
-    """Per-user progress on a skill (0-1 scale or percentage)."""
+    """SQLAlchemy model for tracking user progress on skills."""
+
     __tablename__ = "user_skill_progress"
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     skill_id = Column(Integer, ForeignKey("skills.id"), nullable=False)
-    progress = Column(Float, nullable=False, default=0.0)  # 0.0 to 1.0
+    progress = Column(Float, nullable=False, default=0.0)  # 0..1
 
-# Create tables if they don't exist
+
+# Create schema
 Base.metadata.create_all(bind=engine)
 
 # -----------------------------------------------------------------------------
 # Pydantic Schemas
 # -----------------------------------------------------------------------------
-
 class SkillBase(BaseModel):
     id: int = Field(..., description="Unique identifier for the skill")
     name: str = Field(..., description="Name of the skill")
@@ -164,9 +200,8 @@ class RecommendResponse(BaseModel):
 
 
 # -----------------------------------------------------------------------------
-# FastAPI App
+# FastAPI App and CORS
 # -----------------------------------------------------------------------------
-
 openapi_tags = [
     {"name": "Health", "description": "Health and diagnostics"},
     {"name": "Roles", "description": "Role catalog and details"},
@@ -182,8 +217,7 @@ app = FastAPI(
     openapi_tags=openapi_tags,
 )
 
-# Configure CORS from env (comma-separated list or '*')
-origins: List[str]
+# Configure CORS
 if CORS_ORIGINS.strip() == "*":
     origins = ["*"]
 else:
@@ -200,7 +234,7 @@ app.add_middleware(
 # -----------------------------------------------------------------------------
 # Dependencies
 # -----------------------------------------------------------------------------
-
+# PUBLIC_INTERFACE
 def get_db():
     """Yield a database session per request and ensure it's closed."""
     db = SessionLocal()
@@ -210,56 +244,25 @@ def get_db():
         db.close()
 
 # -----------------------------------------------------------------------------
-# Utility functions
+# Seed helpers
 # -----------------------------------------------------------------------------
-
-def get_role_by_id(db: Session, role_id: int) -> Role:
-    role = db.query(Role).filter(Role.id == role_id).first()
-    if not role:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Role not found")
-    return role
-
-
-def ensure_user(db: Session, email: str) -> User:
-    user = db.query(User).filter(User.email == email).first()
-    if user:
-        return user
-    user = User(email=email, name=email.split("@")[0])
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return user
-
-
-def link_required_level(db: Session, role_id: int, skill_id: int) -> Optional[float]:
-    # Utility to fetch required level if present in association table
-    # For SQLite, reflect using direct query
-    result = db.execute(
-        role_skills_table.select()
-        .where(role_skills_table.c.role_id == role_id)
-        .where(role_skills_table.c.skill_id == skill_id)
-    ).first()
-    if result and "required_level" in result._mapping:
-        return result._mapping["required_level"]
-    return None
-
-# -----------------------------------------------------------------------------
-# Seed minimal data if tables are empty (for MVP local run)
-# -----------------------------------------------------------------------------
-
 def seed_minimal(db: Session) -> None:
+    """Seed a minimal set of roles and skills if DB is empty."""
     if db.query(Role).count() > 0:
         return
-    # Create a minimal set of skills and roles
+
+    # Skills
     skill_python = Skill(name="Python", category="Engineering", description="Programming in Python")
     skill_sql = Skill(name="SQL", category="Data", description="Querying relational databases")
     skill_communication = Skill(name="Communication", category="Leadership", description="Clear communication")
     db.add_all([skill_python, skill_sql, skill_communication])
     db.commit()
+
     db.refresh(skill_python)
     db.refresh(skill_sql)
     db.refresh(skill_communication)
 
+    # Roles
     role_ds = Role(name="Data Scientist", description="Builds models and analyzes data")
     role_ds.skills = [skill_python, skill_sql, skill_communication]
     db.add(role_ds)
@@ -273,7 +276,6 @@ def seed_minimal(db: Session) -> None:
 # -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
-
 # PUBLIC_INTERFACE
 @app.get("/", tags=["Health"], summary="Health Check")
 def health_check():
@@ -283,26 +285,40 @@ def health_check():
     """
     return {"message": "Healthy"}
 
+
 # PUBLIC_INTERFACE
 @app.on_event("startup")
 def on_startup():
-    """Startup hook to ensure DB schema and seed minimal data."""
+    """Ensure DB schema exists and seed minimal data on startup."""
     Base.metadata.create_all(bind=engine)
     with SessionLocal() as db:
         seed_minimal(db)
 
+
 # PUBLIC_INTERFACE
-@app.get("/roles", response_model=List[RoleBase], tags=["Roles"], summary="List roles")
+@app.get(
+    "/roles",
+    response_model=List[RoleBase],
+    tags=["Roles"],
+    summary="List roles",
+    description="List all roles with basic details.",
+)
 def list_roles(db: Session = Depends(get_db)):
     """List all roles with basic details.
     Returns:
         List[RoleBase]: Array of roles.
     """
-    roles = db.query(Role).order_by(Role.name.asc()).all()
-    return roles
+    return db.query(Role).order_by(Role.name.asc()).all()
+
 
 # PUBLIC_INTERFACE
-@app.get("/roles/{role_id}", response_model=RoleDetail, tags=["Roles"], summary="Get role by ID")
+@app.get(
+    "/roles/{role_id}",
+    response_model=RoleDetail,
+    tags=["Roles"],
+    summary="Get role by ID",
+    description="Get role details including associated skills.",
+)
 def get_role(role_id: int, db: Session = Depends(get_db)):
     """Get role details including associated skills.
     Args:
@@ -310,7 +326,9 @@ def get_role(role_id: int, db: Session = Depends(get_db)):
     Returns:
         RoleDetail: Role with skills
     """
-    role = get_role_by_id(db, role_id)
+    role = db.query(Role).filter(Role.id == role_id).first()
+    if not role:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Role not found")
     return RoleDetail(
         id=role.id,
         name=role.name,
@@ -318,8 +336,15 @@ def get_role(role_id: int, db: Session = Depends(get_db)):
         skills=[SkillBase.model_validate(s) for s in role.skills],
     )
 
+
 # PUBLIC_INTERFACE
-@app.post("/gap-analysis", response_model=GapAnalysisResponse, tags=["Analysis"], summary="Perform gap analysis")
+@app.post(
+    "/gap-analysis",
+    response_model=GapAnalysisResponse,
+    tags=["Analysis"],
+    summary="Perform gap analysis",
+    description="Perform gap analysis between user's current skills and a target role's required skills.",
+)
 def post_gap_analysis(payload: GapAnalysisRequest, db: Session = Depends(get_db)):
     """Perform gap analysis between user's current skills and a target role's required skills.
     Args:
@@ -327,7 +352,10 @@ def post_gap_analysis(payload: GapAnalysisRequest, db: Session = Depends(get_db)
     Returns:
         GapAnalysisResponse: Gaps and suggested actions
     """
-    role = get_role_by_id(db, payload.target_role_id)
+    role = db.query(Role).filter(Role.id == payload.target_role_id).first()
+    if not role:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Role not found")
+
     current_set = {s.lower() for s in payload.current_skills}
     gaps: List[GapItem] = []
 
@@ -354,8 +382,15 @@ def post_gap_analysis(payload: GapAnalysisRequest, db: Session = Depends(get_db)
         gaps=gaps,
     )
 
+
 # PUBLIC_INTERFACE
-@app.post("/roadmap", response_model=RoadmapResponse, tags=["Analysis"], summary="Generate roadmap graph")
+@app.post(
+    "/roadmap",
+    response_model=RoadmapResponse,
+    tags=["Analysis"],
+    summary="Generate roadmap graph",
+    description="Generate a simple Cytoscape.js graph representing steps from current skills to a target role.",
+)
 def post_roadmap(payload: RoadmapRequest, db: Session = Depends(get_db)):
     """Generate a simple Cytoscape.js graph representing steps from current skills to a target role.
     Args:
@@ -363,36 +398,29 @@ def post_roadmap(payload: RoadmapRequest, db: Session = Depends(get_db)):
     Returns:
         RoadmapResponse: Cytoscape.js elements
     """
-    role = get_role_by_id(db, payload.target_role_id)
+    role = db.query(Role).filter(Role.id == payload.target_role_id).first()
+    if not role:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Role not found")
+
     current_set = {s.lower() for s in payload.current_skills}
 
     elements: List[CytoscapeElement] = []
 
-    # Node for role
+    # Role node
     role_node_id = f"role-{role.id}"
-    elements.append(
-        CytoscapeElement(
-            data={"id": role_node_id, "label": role.name, "type": "role"},
-            group="nodes",
-        )
-    )
+    elements.append(CytoscapeElement(data={"id": role_node_id, "label": role.name, "type": "role"}, group="nodes"))
 
-    # Nodes for each required skill
+    # Skill nodes and edges
     for skill in role.skills:
         skill_node_id = f"skill-{skill.id}"
         have_it = skill.name.lower() in current_set
+
         elements.append(
             CytoscapeElement(
-                data={
-                    "id": skill_node_id,
-                    "label": skill.name,
-                    "type": "skill",
-                    "status": "have" if have_it else "need",
-                },
+                data={"id": skill_node_id, "label": skill.name, "type": "skill", "status": "have" if have_it else "need"},
                 group="nodes",
             )
         )
-        # Edge from skill to role (indicating prerequisite)
         elements.append(
             CytoscapeElement(
                 data={"id": f"edge-{skill_node_id}-{role_node_id}", "source": skill_node_id, "target": role_node_id, "type": "requires"},
@@ -401,18 +429,8 @@ def post_roadmap(payload: RoadmapRequest, db: Session = Depends(get_db)):
         )
 
         if not have_it:
-            # Add a learning task node for missing skills
             task_node_id = f"task-{skill.id}"
-            elements.append(
-                CytoscapeElement(
-                    data={
-                        "id": task_node_id,
-                        "label": f"Learn {skill.name}",
-                        "type": "task",
-                    },
-                    group="nodes",
-                )
-            )
+            elements.append(CytoscapeElement(data={"id": task_node_id, "label": f"Learn {skill.name}", "type": "task"}, group="nodes"))
             elements.append(
                 CytoscapeElement(
                     data={"id": f"edge-{task_node_id}-{skill_node_id}", "source": task_node_id, "target": skill_node_id, "type": "enables"},
@@ -422,8 +440,14 @@ def post_roadmap(payload: RoadmapRequest, db: Session = Depends(get_db)):
 
     return RoadmapResponse(elements=elements)
 
+
 # PUBLIC_INTERFACE
-@app.post("/progress/update", tags=["Progress"], summary="Update user skill progress")
+@app.post(
+    "/progress/update",
+    tags=["Progress"],
+    summary="Update user skill progress",
+    description="Update or create the user's progress for a given skill.",
+)
 def post_progress_update(payload: ProgressUpdateRequest, db: Session = Depends(get_db)):
     """Update or create the user's progress for a given skill.
     Args:
@@ -431,7 +455,15 @@ def post_progress_update(payload: ProgressUpdateRequest, db: Session = Depends(g
     Returns:
         dict: status message and current record
     """
-    user = ensure_user(db, payload.user_email)
+    # Ensure user
+    user = db.query(User).filter(User.email == payload.user_email).first()
+    if not user:
+        user = User(email=payload.user_email, name=payload.user_email.split("@")[0])
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+    # Case-insensitive exact match for skill name
     skill = db.query(Skill).filter(Skill.name.ilike(payload.skill_name)).first()
     if not skill:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Skill not found")
@@ -441,7 +473,6 @@ def post_progress_update(payload: ProgressUpdateRequest, db: Session = Depends(g
         .filter(UserSkillProgress.user_id == user.id, UserSkillProgress.skill_id == skill.id)
         .first()
     )
-
     if record:
         record.progress = payload.progress
     else:
@@ -451,15 +482,17 @@ def post_progress_update(payload: ProgressUpdateRequest, db: Session = Depends(g
     db.commit()
     db.refresh(record)
 
-    return {
-        "message": "Progress updated",
-        "user_email": payload.user_email,
-        "skill_name": skill.name,
-        "progress": record.progress,
-    }
+    return {"message": "Progress updated", "user_email": payload.user_email, "skill_name": skill.name, "progress": record.progress}
+
 
 # PUBLIC_INTERFACE
-@app.post("/recommend", response_model=RecommendResponse, tags=["LLM"], summary="Proxy to LLM recommend service")
+@app.post(
+    "/recommend",
+    response_model=RecommendResponse,
+    tags=["LLM"],
+    summary="Proxy to LLM recommend service",
+    description="Proxy request to an LLM recommendation microservice.",
+)
 async def post_recommend(payload: RecommendRequest, db: Session = Depends(get_db)):
     """Proxy request to an LLM recommendation microservice.
     Args:
@@ -467,20 +500,13 @@ async def post_recommend(payload: RecommendRequest, db: Session = Depends(get_db
     Returns:
         RecommendResponse: LLM service response payload
     """
-    # Optionally enrich with role details
     role_info = None
     if payload.target_role_id is not None:
-        try:
-            role = get_role_by_id(db, payload.target_role_id)
+        role = db.query(Role).filter(Role.id == payload.target_role_id).first()
+        if role:
             role_info = {"id": role.id, "name": role.name, "skills": [s.name for s in role.skills]}
-        except HTTPException:
-            role_info = None
 
-    proxy_body = {
-        "user_profile": payload.user_profile,
-        "current_skills": payload.current_skills,
-        "target_role": role_info,
-    }
+    proxy_body = {"user_profile": payload.user_profile, "current_skills": payload.current_skills, "target_role": role_info}
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -491,7 +517,6 @@ async def post_recommend(payload: RecommendRequest, db: Session = Depends(get_db
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"LLM service error: {str(e)}") from e
 
     if not isinstance(data, dict) or "recommendations" not in data:
-        # Normalize minimal structure
         data = {"recommendations": data}
 
     return RecommendResponse(**data)
